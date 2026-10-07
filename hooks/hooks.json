@@ -12,7 +12,31 @@
         ]
       }
     ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'scripts\\collector.ps1')\"",
+            "commandWindows": "powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'scripts\\collector.ps1')\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'scripts\\collector.ps1')\"",
+            "commandWindows": "powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -Command \"& (Join-Path $env:PLUGIN_ROOT 'scripts\\collector.ps1')\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Interrupt": [
       {
         "hooks": [
           {

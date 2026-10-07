@@ -238,6 +238,63 @@ function ConvertTo-LogDecimal([object]$Value) {
     return ([decimal]$Value).ToString('0.############################', [Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Get-SafeStateName([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '_' }
+    return ($Value -replace '[^A-Za-z0-9._-]', '_')
+}
+
+function Get-SubagentTurnPath([string]$RootTurnId) {
+    return Join-Path (Join-Path $stateRoot 'subagents') (Get-SafeStateName $RootTurnId)
+}
+
+function Save-SubagentUsage([object]$Payload) {
+    $records = @(Read-AllUsageRecords ([string]$Payload.agent_transcript_path))
+    foreach ($group in @($records | Group-Object root_turn_id)) {
+        if ([string]::IsNullOrWhiteSpace([string]$group.Name)) { continue }
+        $directory = Get-SubagentTurnPath ([string]$group.Name)
+        New-Item -ItemType Directory -Force $directory | Out-Null
+        $agentId = if (-not [string]::IsNullOrWhiteSpace([string]$Payload.agent_id)) {
+            Get-SafeStateName ([string]$Payload.agent_id)
+        } elseif (-not [string]::IsNullOrWhiteSpace([string]$Payload.agent_transcript_path)) {
+            Get-SafeStateName ([IO.Path]::GetFileNameWithoutExtension([string]$Payload.agent_transcript_path))
+        } else {
+            [guid]::NewGuid().ToString('N')
+        }
+        $path = Join-Path $directory ($agentId + '.json')
+        $temporary = $path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+        try {
+            [IO.File]::WriteAllText($temporary, (@($group.Group) | ConvertTo-Json -Compress -Depth 6), [Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $temporary -Destination $path -Force
+        } finally {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Read-SubagentUsage([string]$RootTurnId) {
+    $directory = Get-SubagentTurnPath $RootTurnId
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return }
+    foreach ($file in @(Get-ChildItem -LiteralPath $directory -File -Filter '*.json')) {
+        try {
+            $parsed = [IO.File]::ReadAllText($file.FullName, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            foreach ($record in @($parsed)) { Write-Output $record }
+        } catch {
+            try { Append-ErrorLog ('Subagent usage fragment rejected: ' + $file.Name) } catch { }
+        }
+    }
+}
+
+function Remove-TurnState([string]$TurnId, [string]$MarkerPath) {
+    Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
+    $subagentRoot = Join-Path $stateRoot 'subagents'
+    $directory = Get-SubagentTurnPath $TurnId
+    $rootFull = [IO.Path]::GetFullPath($subagentRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $directoryFull = [IO.Path]::GetFullPath($directory)
+    if ($directoryFull.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $directoryFull -PathType Container)) {
+        Remove-Item -LiteralPath $directoryFull -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Complete-Turn([object]$Payload, [string]$Outcome = 'completed') {
     $markerPath = Get-MarkerPath $Payload.turn_id
     if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
@@ -247,7 +304,10 @@ function Complete-Turn([object]$Payload, [string]$Outcome = 'completed') {
     }
     $transcriptPath = if (-not [string]::IsNullOrWhiteSpace([string]$Payload.transcript_path)) { [string]$Payload.transcript_path } else { [string]$marker.transcript_path }
     $offset = if ($transcriptPath -eq [string]$marker.transcript_path) { [int64]$marker.transcript_offset } else { [int64]0 }
-    $usageRecords = @(Select-UniqueUsageRecords @(Read-TurnUsageRecords $transcriptPath ([string]$marker.turn_id) $offset))
+    $usageRecords = @()
+    $usageRecords += @(Read-TurnUsageRecords $transcriptPath ([string]$marker.turn_id) $offset)
+    $usageRecords += @(Read-SubagentUsage ([string]$marker.turn_id))
+    $usageRecords = @(Select-UniqueUsageRecords $usageRecords)
     $rows = @(Wait-AttributedRows $usageRecords ([int64]$marker.start_rowid))
     $context = Build-AttributedTurnContext $usageRecords $rows $marker $Outcome
     $matchedIds = @{}
@@ -261,9 +321,9 @@ function Complete-Turn([object]$Payload, [string]$Outcome = 'completed') {
     }
     $summary = [ordered]@{ type='turn_summary'; logged_at=[DateTimeOffset]::Now.ToString('o'); codex_session_id=$context.codex_session_id; codex_turn_id=$context.codex_turn_id; codex_cwd=$context.codex_cwd; turn_outcome=$context.turn_outcome; attribution_status=$context.attribution_status; request_count=$context.request_count; matched_request_count=$context.matched_request_count; unmatched_request_count=$context.unmatched_request_count; input_tokens=$context.input_tokens; output_tokens=$context.output_tokens; cache_read_tokens=$context.cache_read_tokens; cache_creation_tokens=$context.cache_creation_tokens; input_cost_usd=ConvertTo-LogDecimal $context.input_cost_usd; output_cost_usd=ConvertTo-LogDecimal $context.output_cost_usd; cache_read_cost_usd=ConvertTo-LogDecimal $context.cache_read_cost_usd; cache_creation_cost_usd=ConvertTo-LogDecimal $context.cache_creation_cost_usd; total_cost_usd=ConvertTo-LogDecimal $context.total_cost_usd; duration_ms_total=$context.duration_ms_total; duration_ms_max=$context.duration_ms_max; first_token_ms_first=$context.first_token_ms_first; model=$context.model; provider_id=$context.provider_id; status_code=$context.status_code }
     Append-JsonLine $summary $logPath
-    Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
     $config = Get-Config
     Invoke-UsageNotification $config $context
+    Remove-TurnState ([string]$marker.turn_id) $markerPath
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
@@ -271,7 +331,12 @@ if ($MyInvocation.InvocationName -ne '.') {
         $inputText = Read-Utf8Stdin
         if ([string]::IsNullOrWhiteSpace($inputText)) { exit 0 }
         try { $payload = $inputText | ConvertFrom-Json } catch { $script:HookPayloadParseError = $true; throw 'Hook payload JSON is invalid' }
-        switch ([string]$payload.hook_event_name) { 'UserPromptSubmit' { Start-Turn $payload }; 'Stop' { Complete-Turn $payload } }
+        switch ([string]$payload.hook_event_name) {
+            'UserPromptSubmit' { Start-Turn $payload }
+            'SubagentStop' { Save-SubagentUsage $payload }
+            'Stop' { Complete-Turn $payload 'completed' }
+            'Interrupt' { Complete-Turn $payload 'interrupted' }
+        }
     }
     catch {
         try {

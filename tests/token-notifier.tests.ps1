@@ -41,6 +41,13 @@ function Test-Package {
     Assert-True $readme.Contains('"duration": "short"') 'README must document Toast duration'
     Assert-True $readme.Contains('unregister-toast.ps1') 'README must document cleanup'
     Assert-True $readme.Contains('Windows may truncate') 'README must disclose Toast truncation'
+    $hooks = Get-Content -Raw -Encoding UTF8 (Join-Path $repoRoot 'hooks\hooks.json') | ConvertFrom-Json
+    Assert-Equal 1 @($hooks.hooks.UserPromptSubmit).Count 'UserPromptSubmit Hook must exist'
+    Assert-Equal 1 @($hooks.hooks.SubagentStop).Count 'SubagentStop Hook must exist'
+    Assert-Equal 1 @($hooks.hooks.Stop).Count 'Stop Hook must exist'
+    Assert-Equal 1 @($hooks.hooks.Interrupt).Count 'Interrupt Hook must exist'
+    Assert-Equal 5 ([int]$hooks.hooks.SubagentStop[0].hooks[0].timeout) 'SubagentStop Hook must be bounded'
+    Assert-Equal 10 ([int]$hooks.hooks.Interrupt[0].hooks[0].timeout) 'Interrupt Hook needs collection time'
 }
 
 function Test-Config {
@@ -367,6 +374,64 @@ VALUES ('session:codex:p:resp_present','p','codex','m','m','m',30,3,2,0,'0.003',
         Assert-Equal 'partial' $partialSummary.attribution_status 'Missing CC Switch rows must mark a partial turn'
         Assert-Equal 1 ([int]$partialSummary.matched_request_count) 'Partial summary must count matched requests'
         Assert-Equal 1 ([int]$partialSummary.unmatched_request_count) 'Partial summary must count unmatched requests'
+
+        $rootTranscript = Join-Path $testRoot 'root-agent-turn.jsonl'
+        $agentTranscript = Join-Path $testRoot 'agent-turn.jsonl'
+        [IO.File]::WriteAllText($rootTranscript, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($agentTranscript, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
+        $rootStart = @{hook_event_name='UserPromptSubmit';session_id='session-agent-root';turn_id='root-turn';cwd='C:\agents';transcript_path=$rootTranscript} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $rootStart).ExitCode 'Agent root turn must start'
+        Add-UsageRecord $rootTranscript 'root-turn' 'root-turn' 'resp_root_turn' 50 5 4 0
+        Add-UsageRecord $rootTranscript 'child-turn' 'root-turn' 'resp_child_turn' 70 7 6 0
+        Add-UsageRecord $agentTranscript 'child-turn' 'root-turn' 'resp_child_turn' 70 7 6 0
+        Add-UsageRecord $agentTranscript 'child-turn' 'root-turn' 'resp_child_turn_2' 30 3 2 0
+        Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
+        $subagentStop = @{hook_event_name='SubagentStop';session_id='session-agent-root';turn_id='child-turn';agent_id='agent-1';agent_type='worker';agent_transcript_path=$agentTranscript} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $subagentStop).ExitCode 'SubagentStop Hook must succeed'
+        Assert-True (-not (Test-Path -LiteralPath $capturePath)) 'SubagentStop must not notify independently'
+        Assert-True (Test-Path -LiteralPath (Join-Path $testRoot 'state\subagents\root-turn\agent-1.json')) 'Subagent usage fragment must be persisted'
+        $agentRows = @'
+INSERT INTO proxy_request_logs
+(request_id,provider_id,app_type,model,request_model,pricing_model,input_tokens,output_tokens,
+ cache_read_tokens,cache_creation_tokens,input_cost_usd,output_cost_usd,cache_read_cost_usd,
+ cache_creation_cost_usd,total_cost_usd,latency_ms,first_token_ms,duration_ms,status_code,created_at,data_source)
+VALUES
+('session:codex:p:resp_root_turn','p','codex','m','m','m',50,5,4,0,'0.005','0.01','0.001','0','0.016',70,15,160,200,7,'proxy'),
+('session:codex:p:resp_child_turn','p','codex','m','m','m',70,7,6,0,'0.007','0.014','0.001','0','0.022',80,16,180,200,8,'proxy'),
+('session:codex:p:resp_child_turn_2','p','codex','m','m','m',30,3,2,0,'0.003','0.006','0.001','0','0.01',60,12,120,200,9,'proxy');
+'@
+        $agentRows | & sqlite3 $dbPath
+        Assert-Equal 0 $LASTEXITCODE 'Root and agent rows must be inserted'
+        $rootStop = @{hook_event_name='Stop';session_id='session-agent-root';turn_id='root-turn';cwd='C:\agents';transcript_path=$rootTranscript} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $rootStop).ExitCode 'Agent root turn must stop'
+        Assert-True (Wait-ForPath $capturePath) 'Aggregated agent notification must be captured'
+        $agentPayload = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-Equal '150' $agentPayload.items[1].value 'Root notification must include every child input once'
+        Assert-Equal '15' $agentPayload.items[2].value 'Root notification must include every child output once'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $testRoot 'state\subagents\root-turn'))) 'Root completion must remove child fragments'
+
+        $interruptTranscript = Join-Path $testRoot 'interrupted-turn.jsonl'
+        [IO.File]::WriteAllText($interruptTranscript, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
+        $interruptStart = @{hook_event_name='UserPromptSubmit';session_id='session-interrupt';turn_id='turn-interrupt';cwd='C:\interrupt';transcript_path=$interruptTranscript} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $interruptStart).ExitCode 'Interrupted turn must start'
+        Add-UsageRecord $interruptTranscript 'turn-interrupt' 'turn-interrupt' 'resp_interrupted' 25 2 1 0
+        $interruptRow = @'
+INSERT INTO proxy_request_logs
+(request_id,provider_id,app_type,model,request_model,pricing_model,input_tokens,output_tokens,
+ cache_read_tokens,cache_creation_tokens,input_cost_usd,output_cost_usd,cache_read_cost_usd,
+ cache_creation_cost_usd,total_cost_usd,latency_ms,first_token_ms,duration_ms,status_code,created_at,data_source)
+VALUES ('session:codex:p:resp_interrupted','p','codex','m','m','m',25,2,1,0,'0.0025','0.004','0.0005','0','0.007',40,9,90,200,10,'proxy');
+'@
+        $interruptRow | & sqlite3 $dbPath
+        Assert-Equal 0 $LASTEXITCODE 'Interrupted row must be inserted'
+        Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
+        $interrupt = @{hook_event_name='Interrupt';session_id='session-interrupt';turn_id='turn-interrupt';cwd='C:\interrupt';transcript_path=$interruptTranscript} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $interrupt).ExitCode 'Interrupt Hook must succeed'
+        Assert-True (Wait-ForPath $capturePath) 'Interrupted notification must be captured'
+        $allSummaries = @([IO.File]::ReadAllLines((Join-Path $testRoot 'logs\usage.jsonl'), [Text.Encoding]::UTF8) | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object type -eq 'turn_summary')
+        $interruptSummary = $allSummaries | Where-Object codex_turn_id -eq 'turn-interrupt' | Select-Object -Last 1
+        Assert-Equal 'interrupted' $interruptSummary.turn_outcome 'Interrupt summary must retain its outcome'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $testRoot 'state\turns\turn-interrupt.json'))) 'Interrupt must remove its marker'
     } finally {
         Remove-Item Env:CCSWITCH_DB_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:TOKENNOTIFIER_DATA_ROOT -ErrorAction SilentlyContinue
