@@ -1,0 +1,21 @@
+{
+  "name": "token-notifier-marketplace",
+  "interface": {
+    "displayName": "TokenNotifier"
+  },
+  "plugins": [
+    {
+      "name": "token-notifier",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Lunfeng/TokrnNotifier.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+# Runtime and local usage data
+logs/
+*.jsonl
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Local configuration and secrets
+.env
+config.local.json
+
+# Editor and operating-system files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

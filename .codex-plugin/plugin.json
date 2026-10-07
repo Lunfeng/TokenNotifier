@@ -1,0 +1,41 @@
+{
+  "name": "token-notifier",
+  "version": "0.1.1",
+  "description": "Show CC Switch token usage and cost after each Codex answer.",
+  "author": {
+    "name": "Lunfeng"
+  },
+  "homepage": "https://github.com/Lunfeng/TokrnNotifier",
+  "repository": "https://github.com/Lunfeng/TokrnNotifier",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "usage",
+    "tokens",
+    "cost",
+    "cc-switch"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "TokenNotifier",
+    "shortDescription": "Show token usage and cost after each Codex answer",
+    "longDescription": "A Windows 10/11 Codex plugin that reads CC Switch usage records and displays configurable token, cost, latency, and calculated metrics after each completed answer.",
+    "developerName": "Lunfeng",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Lunfeng/TokrnNotifier",
+    "supportURL": "https://github.com/Lunfeng/TokrnNotifier/issues",
+    "privacyPolicyURL": "https://openai.com/policies/privacy-policy/",
+    "termsOfServiceURL": "https://openai.com/policies/terms-of-use/",
+    "defaultPrompt": [
+      "Show the latest Codex usage summary.",
+      "Help me configure TokenNotifier usage fields."
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}
