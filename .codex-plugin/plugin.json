@@ -5,8 +5,8 @@
   "author": {
     "name": "Lunfeng"
   },
-  "homepage": "https://github.com/Lunfeng/TokrnNotifier",
-  "repository": "https://github.com/Lunfeng/TokrnNotifier",
+  "homepage": "https://github.com/Lunfeng/TokenNotifier",
+  "repository": "https://github.com/Lunfeng/TokenNotifier",
   "license": "MIT",
   "keywords": [
     "codex",
@@ -27,8 +27,8 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/Lunfeng/TokrnNotifier",
-    "supportURL": "https://github.com/Lunfeng/TokrnNotifier/issues",
+    "websiteURL": "https://github.com/Lunfeng/TokenNotifier",
+    "supportURL": "https://github.com/Lunfeng/TokenNotifier/issues",
     "privacyPolicyURL": "https://openai.com/policies/privacy-policy/",
     "termsOfServiceURL": "https://openai.com/policies/terms-of-use/",
     "defaultPrompt": [
