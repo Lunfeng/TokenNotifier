@@ -10,7 +10,7 @@ Add the repository marketplace, then install `token-notifier` from the Codex
 plugin directory:
 
 ```text
-https://github.com/Lunfeng/TokrnNotifier.git
+https://github.com/Lunfeng/TokenNotifier.git
 ```
 
 Review and trust the plugin Hooks when Codex asks. The package registers
