@@ -9,6 +9,7 @@ $script:ConfigLoadError = $null
 $script:HookPayloadParseError = $false
 
 . (Join-Path $PSScriptRoot 'evaluator.ps1')
+. (Join-Path $PSScriptRoot 'attribution.ps1')
 
 function Append-ErrorLog([string]$Detail) {
     New-Item -ItemType Directory -Force (Split-Path -Parent $errorLogPath) | Out-Null
@@ -73,13 +74,25 @@ function Get-ReadOnlySqlRows([string]$Sql) {
     foreach ($item in @($parsed)) { Write-Output $item }
 }
 
-function Get-MarkerPath([string]$TurnId) { Join-Path $stateRoot (($TurnId -replace '[^A-Za-z0-9._-]', '_') + '.json') }
+function Get-MarkerPath([string]$TurnId) {
+    $turnRoot = Join-Path $stateRoot 'turns'
+    return Join-Path $turnRoot (($TurnId -replace '[^A-Za-z0-9._-]', '_') + '.json')
+}
 
 function Start-Turn([object]$Payload) {
-    New-Item -ItemType Directory -Force $stateRoot | Out-Null
+    $markerPath = Get-MarkerPath $Payload.turn_id
+    New-Item -ItemType Directory -Force (Split-Path -Parent $markerPath) | Out-Null
     $rows = @(Get-ReadOnlySqlRows "SELECT COALESCE(MAX(rowid), 0) AS max_rowid FROM proxy_request_logs WHERE app_type = 'codex' AND data_source = 'proxy';")
-    $marker = [ordered]@{ session_id=[string]$Payload.session_id; turn_id=[string]$Payload.turn_id; cwd=[string]$Payload.cwd; start_rowid=[int64]$rows[0].max_rowid; started_at=[DateTimeOffset]::Now.ToString('o') }
-    [IO.File]::WriteAllText((Get-MarkerPath $Payload.turn_id), ($marker | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    $marker = [ordered]@{
+        session_id = [string]$Payload.session_id
+        turn_id = [string]$Payload.turn_id
+        cwd = [string]$Payload.cwd
+        transcript_path = [string]$Payload.transcript_path
+        transcript_offset = Get-TranscriptLength ([string]$Payload.transcript_path)
+        start_rowid = [int64]$rows[0].max_rowid
+        started_at = [DateTimeOffset]::Now.ToString('o')
+    }
+    [IO.File]::WriteAllText($markerPath, ($marker | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
 }
 
 function Append-JsonLine([object]$Value, [string]$Path) {
@@ -155,36 +168,100 @@ function Invoke-UsageNotification([object]$Config, [object]$Context) {
     if ($Config.enabled -ne $false) { Invoke-DetachedNotifier $payload }
 }
 
-function Build-TurnContext([object[]]$Rows, [object]$Marker, [object]$Payload) {
-    $sum = { param($Name) [decimal]$value = 0; foreach ($row in $Rows) { if ($null -ne $row.$Name -and $row.$Name -ne '') { $value += [decimal]::Parse([string]$row.$Name, [Globalization.CultureInfo]::InvariantCulture) } }; return $value }
-    $intSum = { param($Name) $value = ($Rows | ForEach-Object { if ($null -ne $_.$Name -and $_.$Name -ne '') { [int64]$_.$Name } else { [int64]0 } } | Measure-Object -Sum).Sum; return [int64]$value }
-    $durations = @($Rows | Where-Object { $null -ne $_.duration_ms -and $_.duration_ms -ne '' } | ForEach-Object { [int64]$_.duration_ms })
-    $firstToken = @($Rows | Where-Object { $null -ne $_.first_token_ms -and $_.first_token_ms -ne '' } | Select-Object -First 1 | ForEach-Object { [int64]$_.first_token_ms })
-    $models = @($Rows | ForEach-Object { [string]$_.model } | Select-Object -Unique)
-    $providers = @($Rows | ForEach-Object { [string]$_.provider_id } | Select-Object -Unique)
-    $statuses = @($Rows | ForEach-Object { if ($null -ne $_.status_code -and $_.status_code -ne '') { [int]$_.status_code } } | Select-Object -Unique)
-    [pscustomobject]@{
-        request_count = $Rows.Count; input_tokens = & $intSum 'input_tokens'; output_tokens = & $intSum 'output_tokens'; cache_read_tokens = & $intSum 'cache_read_tokens'; cache_creation_tokens = & $intSum 'cache_creation_tokens'
-        input_cost_usd = & $sum 'input_cost_usd'; output_cost_usd = & $sum 'output_cost_usd'; cache_read_cost_usd = & $sum 'cache_read_cost_usd'; cache_creation_cost_usd = & $sum 'cache_creation_cost_usd'; total_cost_usd = & $sum 'total_cost_usd'
-        duration_ms_total = if ($durations.Count) { [int64](($durations | Measure-Object -Sum).Sum) } else { $null }; duration_ms_max = if ($durations.Count) { [int64](($durations | Measure-Object -Maximum).Maximum) } else { $null }; first_token_ms_first = if ($firstToken.Count) { $firstToken[0] } else { $null }
-        model = if ($models.Count -eq 1) { $models[0] } else { 'multiple' }; provider_id = if ($providers.Count -eq 1) { $providers[0] } else { 'multiple' }; status_code = if ($statuses.Count -eq 1) { $statuses[0] } else { 'multiple' }
-        codex_session_id = [string]$Marker.session_id; codex_turn_id = [string]$Marker.turn_id; codex_cwd = [string]$Marker.cwd
+function Wait-AttributedRows([object[]]$UsageRecords, [int64]$StartRowId) {
+    if (@($UsageRecords).Count -eq 0) { return @() }
+    $timeout = if ($env:TOKENNOTIFIER_SETTLE_TIMEOUT_MS) { [int]$env:TOKENNOTIFIER_SETTLE_TIMEOUT_MS } elseif ($env:CCSWITCH_SETTLE_DELAY_MS) { [int]$env:CCSWITCH_SETTLE_DELAY_MS } else { 1000 }
+    $interval = if ($env:TOKENNOTIFIER_SETTLE_INTERVAL_MS) { [int]$env:TOKENNOTIFIER_SETTLE_INTERVAL_MS } else { 100 }
+    $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(0, $timeout))
+    do {
+        $sql = "SELECT rowid,request_id,provider_id,provider_type,model,request_model,pricing_model,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd,total_cost_usd,cost_multiplier,latency_ms,first_token_ms,duration_ms,status_code,error_message,session_id,is_streaming,created_at,data_source FROM proxy_request_logs WHERE rowid > $StartRowId AND app_type = 'codex' AND data_source = 'proxy' ORDER BY rowid;"
+        $rows = @(Get-ReadOnlySqlRows $sql)
+        $matched = @(Select-AttributedRows $rows $UsageRecords)
+        if ($matched.Count -ge @($UsageRecords).Count -or [DateTime]::UtcNow -ge $deadline) { return $matched }
+        Start-Sleep -Milliseconds ([Math]::Max(1, $interval))
+    } while ($true)
+}
+
+function Get-DecimalRowSum([object[]]$Rows, [string]$Name) {
+    [decimal]$value = 0
+    foreach ($row in @($Rows)) {
+        if ($null -ne $row.$Name -and [string]$row.$Name -ne '') {
+            $value += [decimal]::Parse([string]$row.$Name, [Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    return $value
+}
+
+function Build-AttributedTurnContext([object[]]$UsageRecords, [object[]]$Rows, [object]$Marker, [string]$Outcome) {
+    $records = @(Select-UniqueUsageRecords $UsageRecords)
+    $tokens = Measure-ProjectedTokens $records
+    $requestCount = $records.Count
+    $matchedCount = @($Rows).Count
+    $unmatchedCount = [Math]::Max(0, $requestCount - $matchedCount)
+    $attributionStatus = if ($requestCount -eq 0) { 'unavailable' } elseif ($unmatchedCount -gt 0) { 'partial' } else { 'exact' }
+    $exact = $attributionStatus -eq 'exact'
+    $durations = if ($exact) { @($Rows | Where-Object { $null -ne $_.duration_ms -and [string]$_.duration_ms -ne '' } | ForEach-Object { [int64]$_.duration_ms }) } else { @() }
+    $firstToken = if ($exact) { @($Rows | Where-Object { $null -ne $_.first_token_ms -and [string]$_.first_token_ms -ne '' } | Select-Object -First 1 | ForEach-Object { [int64]$_.first_token_ms }) } else { @() }
+    $models = if ($exact) { @($Rows | ForEach-Object { [string]$_.model } | Select-Object -Unique) } else { @() }
+    $providers = if ($exact) { @($Rows | ForEach-Object { [string]$_.provider_id } | Select-Object -Unique) } else { @() }
+    $statuses = if ($exact) { @($Rows | ForEach-Object { if ($null -ne $_.status_code -and [string]$_.status_code -ne '') { [int]$_.status_code } } | Select-Object -Unique) } else { @() }
+    return [pscustomobject]@{
+        request_count = $requestCount
+        matched_request_count = $matchedCount
+        unmatched_request_count = $unmatchedCount
+        input_tokens = $tokens.input_tokens
+        output_tokens = $tokens.output_tokens
+        cache_read_tokens = $tokens.cache_read_tokens
+        cache_creation_tokens = $tokens.cache_creation_tokens
+        input_cost_usd = if ($exact) { Get-DecimalRowSum $Rows 'input_cost_usd' } else { $null }
+        output_cost_usd = if ($exact) { Get-DecimalRowSum $Rows 'output_cost_usd' } else { $null }
+        cache_read_cost_usd = if ($exact) { Get-DecimalRowSum $Rows 'cache_read_cost_usd' } else { $null }
+        cache_creation_cost_usd = if ($exact) { Get-DecimalRowSum $Rows 'cache_creation_cost_usd' } else { $null }
+        total_cost_usd = if ($exact) { Get-DecimalRowSum $Rows 'total_cost_usd' } else { $null }
+        duration_ms_total = if ($durations.Count) { [int64](($durations | Measure-Object -Sum).Sum) } else { $null }
+        duration_ms_max = if ($durations.Count) { [int64](($durations | Measure-Object -Maximum).Maximum) } else { $null }
+        first_token_ms_first = if ($firstToken.Count) { $firstToken[0] } else { $null }
+        model = if ($models.Count -eq 1) { $models[0] } elseif ($models.Count -gt 1) { 'multiple' } else { $null }
+        provider_id = if ($providers.Count -eq 1) { $providers[0] } elseif ($providers.Count -gt 1) { 'multiple' } else { $null }
+        status_code = if ($statuses.Count -eq 1) { $statuses[0] } elseif ($statuses.Count -gt 1) { 'multiple' } else { $null }
+        turn_outcome = $Outcome
+        attribution_status = $attributionStatus
+        thread_name = $null
+        codex_session_id = [string]$Marker.session_id
+        codex_turn_id = [string]$Marker.turn_id
+        codex_cwd = [string]$Marker.cwd
     }
 }
 
-function Complete-Turn([object]$Payload) {
+function ConvertTo-LogDecimal([object]$Value) {
+    if ($null -eq $Value -or [string]$Value -eq '') { return $null }
+    return ([decimal]$Value).ToString('0.############################', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Complete-Turn([object]$Payload, [string]$Outcome = 'completed') {
     $markerPath = Get-MarkerPath $Payload.turn_id
-    if (-not (Test-Path $markerPath)) { throw "Turn marker not found: $markerPath" }
-    $marker = [IO.File]::ReadAllText($markerPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
-    $delay = if ($env:CCSWITCH_SETTLE_DELAY_MS) { [int]$env:CCSWITCH_SETTLE_DELAY_MS } else { 750 }; if ($delay -gt 0) { Start-Sleep -Milliseconds $delay }
-    $sql = "SELECT rowid,request_id,provider_id,provider_type,model,request_model,pricing_model,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,input_cost_usd,output_cost_usd,cache_read_cost_usd,cache_creation_cost_usd,total_cost_usd,cost_multiplier,latency_ms,first_token_ms,duration_ms,status_code,error_message,session_id,is_streaming,created_at,data_source FROM proxy_request_logs WHERE rowid > $([int64]$marker.start_rowid) AND app_type = 'codex' AND data_source = 'proxy' ORDER BY rowid;"
-    $rows = @(Get-ReadOnlySqlRows $sql); $context = Build-TurnContext $rows $marker $Payload
-    foreach ($row in $rows) {
-        Append-JsonLine ([ordered]@{ type='ccswitch_request'; logged_at=[DateTimeOffset]::Now.ToString('o'); codex_session_id=[string]$marker.session_id; codex_turn_id=[string]$marker.turn_id; codex_cwd=[string]$marker.cwd; rowid=[int64]$row.rowid; request_id=[string]$row.request_id; provider_id=[string]$row.provider_id; provider_type=[string]$row.provider_type; model=[string]$row.model; request_model=[string]$row.request_model; pricing_model=[string]$row.pricing_model; input_tokens=[int64]$row.input_tokens; output_tokens=[int64]$row.output_tokens; cache_read_tokens=[int64]$row.cache_read_tokens; cache_creation_tokens=[int64]$row.cache_creation_tokens; input_cost_usd=[string]$row.input_cost_usd; output_cost_usd=[string]$row.output_cost_usd; cache_read_cost_usd=[string]$row.cache_read_cost_usd; cache_creation_cost_usd=[string]$row.cache_creation_cost_usd; total_cost_usd=[string]$row.total_cost_usd; cost_multiplier=[string]$row.cost_multiplier; latency_ms=$row.latency_ms; first_token_ms=$row.first_token_ms; duration_ms=$row.duration_ms; status_code=[int]$row.status_code; error_message=$row.error_message; ccswitch_session_id=[string]$row.session_id; is_streaming=([int]$row.is_streaming -eq 1); created_at_unix=[int64]$row.created_at }) $logPath
+    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+        $marker = [IO.File]::ReadAllText($markerPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    } else {
+        $marker = [pscustomobject]@{ session_id=[string]$Payload.session_id; turn_id=[string]$Payload.turn_id; cwd=[string]$Payload.cwd; transcript_path=[string]$Payload.transcript_path; transcript_offset=[int64]0; start_rowid=[int64]0; started_at=[DateTimeOffset]::Now.ToString('o') }
     }
-    $summary = [ordered]@{ type='turn_summary'; logged_at=[DateTimeOffset]::Now.ToString('o'); codex_session_id=$context.codex_session_id; codex_turn_id=$context.codex_turn_id; codex_cwd=$context.codex_cwd; request_count=$context.request_count; input_tokens=$context.input_tokens; output_tokens=$context.output_tokens; cache_read_tokens=$context.cache_read_tokens; cache_creation_tokens=$context.cache_creation_tokens; input_cost_usd=$context.input_cost_usd.ToString('0.############################', [Globalization.CultureInfo]::InvariantCulture); output_cost_usd=$context.output_cost_usd.ToString('0.############################', [Globalization.CultureInfo]::InvariantCulture); cache_read_cost_usd=$context.cache_read_cost_usd.ToString('0.############################', [Globalization.CultureInfo]::InvariantCulture); cache_creation_cost_usd=$context.cache_creation_cost_usd.ToString('0.############################', [Globalization.CultureInfo]::InvariantCulture); total_cost_usd=$context.total_cost_usd.ToString('0.############################', [Globalization.CultureInfo]::InvariantCulture); duration_ms_total=$context.duration_ms_total; duration_ms_max=$context.duration_ms_max; first_token_ms_first=$context.first_token_ms_first; model=$context.model; provider_id=$context.provider_id; status_code=$context.status_code }
+    $transcriptPath = if (-not [string]::IsNullOrWhiteSpace([string]$Payload.transcript_path)) { [string]$Payload.transcript_path } else { [string]$marker.transcript_path }
+    $offset = if ($transcriptPath -eq [string]$marker.transcript_path) { [int64]$marker.transcript_offset } else { [int64]0 }
+    $usageRecords = @(Select-UniqueUsageRecords @(Read-TurnUsageRecords $transcriptPath ([string]$marker.turn_id) $offset))
+    $rows = @(Wait-AttributedRows $usageRecords ([int64]$marker.start_rowid))
+    $context = Build-AttributedTurnContext $usageRecords $rows $marker $Outcome
+    $matchedIds = @{}
+    foreach ($row in $rows) {
+        $matchedIds[[string]$row.attribution_response_id] = $true
+        Append-JsonLine ([ordered]@{ type='ccswitch_request'; logged_at=[DateTimeOffset]::Now.ToString('o'); codex_session_id=[string]$marker.session_id; codex_turn_id=[string]$marker.turn_id; codex_cwd=[string]$marker.cwd; rowid=[int64]$row.rowid; request_id=[string]$row.request_id; response_id=[string]$row.attribution_response_id; provider_id=[string]$row.provider_id; provider_type=[string]$row.provider_type; model=[string]$row.model; request_model=[string]$row.request_model; pricing_model=[string]$row.pricing_model; input_tokens=[int64]$row.input_tokens; output_tokens=[int64]$row.output_tokens; cache_read_tokens=[int64]$row.cache_read_tokens; cache_creation_tokens=[int64]$row.cache_creation_tokens; input_cost_usd=[string]$row.input_cost_usd; output_cost_usd=[string]$row.output_cost_usd; cache_read_cost_usd=[string]$row.cache_read_cost_usd; cache_creation_cost_usd=[string]$row.cache_creation_cost_usd; total_cost_usd=[string]$row.total_cost_usd; cost_multiplier=[string]$row.cost_multiplier; latency_ms=$row.latency_ms; first_token_ms=$row.first_token_ms; duration_ms=$row.duration_ms; status_code=[int]$row.status_code; error_message=$row.error_message; ccswitch_session_id=[string]$row.session_id; is_streaming=([int]$row.is_streaming -eq 1); created_at_unix=[int64]$row.created_at }) $logPath
+    }
+    foreach ($record in $usageRecords) {
+        if ($matchedIds.ContainsKey([string]$record.response_id)) { continue }
+        Append-JsonLine ([ordered]@{ type='unmatched_request'; logged_at=[DateTimeOffset]::Now.ToString('o'); codex_session_id=[string]$marker.session_id; codex_turn_id=[string]$marker.turn_id; response_id=[string]$record.response_id; input_tokens=[int64]$record.input_tokens; output_tokens=[int64]$record.output_tokens; cache_read_tokens=[int64]$record.cache_read_tokens; cache_creation_tokens=[int64]$record.cache_creation_tokens }) $logPath
+    }
+    $summary = [ordered]@{ type='turn_summary'; logged_at=[DateTimeOffset]::Now.ToString('o'); codex_session_id=$context.codex_session_id; codex_turn_id=$context.codex_turn_id; codex_cwd=$context.codex_cwd; turn_outcome=$context.turn_outcome; attribution_status=$context.attribution_status; request_count=$context.request_count; matched_request_count=$context.matched_request_count; unmatched_request_count=$context.unmatched_request_count; input_tokens=$context.input_tokens; output_tokens=$context.output_tokens; cache_read_tokens=$context.cache_read_tokens; cache_creation_tokens=$context.cache_creation_tokens; input_cost_usd=ConvertTo-LogDecimal $context.input_cost_usd; output_cost_usd=ConvertTo-LogDecimal $context.output_cost_usd; cache_read_cost_usd=ConvertTo-LogDecimal $context.cache_read_cost_usd; cache_creation_cost_usd=ConvertTo-LogDecimal $context.cache_creation_cost_usd; total_cost_usd=ConvertTo-LogDecimal $context.total_cost_usd; duration_ms_total=$context.duration_ms_total; duration_ms_max=$context.duration_ms_max; first_token_ms_first=$context.first_token_ms_first; model=$context.model; provider_id=$context.provider_id; status_code=$context.status_code }
     Append-JsonLine $summary $logPath
-    Remove-Item -LiteralPath $markerPath -Force
+    Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
     $config = Get-Config
     Invoke-UsageNotification $config $context
 }

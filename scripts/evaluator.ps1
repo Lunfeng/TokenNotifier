@@ -4,7 +4,8 @@ $script:AllowedEvaluatorFields = @(
     'cache_read_cost_usd', 'cache_creation_cost_usd', 'total_cost_usd',
     'duration_ms_total', 'duration_ms_max', 'first_token_ms_first',
     'model', 'provider_id', 'status_code', 'codex_session_id',
-    'codex_turn_id', 'codex_cwd'
+    'codex_turn_id', 'codex_cwd', 'turn_outcome', 'attribution_status',
+    'matched_request_count', 'unmatched_request_count', 'thread_name'
 )
 
 function Get-AllowedFields {

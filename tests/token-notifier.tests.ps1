@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('All', 'Package', 'Config', 'Evaluator', 'ToastXml', 'Registration', 'Collector')]
+    [ValidateSet('All', 'Package', 'Config', 'Evaluator', 'ToastXml', 'Registration', 'Attribution', 'Collector')]
     [string]$Case = 'All'
 )
 
@@ -155,11 +155,87 @@ function Invoke-CollectorProcess([string]$ScriptPath, [string]$Json) {
     } finally { $process.Dispose() }
 }
 
+function Add-UsageRecord {
+    param(
+        [string]$Path,
+        [string]$TurnId,
+        [string]$RootTurnId,
+        [string]$ResponseId,
+        [int64]$InputTokens,
+        [int64]$OutputTokens,
+        [int64]$CachedInputTokens = 0,
+        [int64]$CacheWriteInputTokens = 0
+    )
+    $record = [ordered]@{
+        type = 'token_usage_record'
+        payload = [ordered]@{
+            thread_id = 'thread-fixture'
+            session_id = 'thread-fixture'
+            turn_id = $TurnId
+            root_turn_id = $RootTurnId
+            response_id = $ResponseId
+            usage = [ordered]@{
+                input_tokens = $InputTokens
+                cached_input_tokens = $CachedInputTokens
+                cache_write_input_tokens = $CacheWriteInputTokens
+                output_tokens = $OutputTokens
+                reasoning_output_tokens = 0
+                total_tokens = $InputTokens + $OutputTokens
+            }
+        }
+    }
+    [IO.File]::AppendAllText($Path, (($record | ConvertTo-Json -Compress -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+}
+
+function Test-Attribution {
+    . (Join-Path $repoRoot 'scripts\attribution.ps1')
+    $testRoot = Join-Path $env:TEMP ('token-notifier-attribution-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force $testRoot | Out-Null
+    try {
+        $transcript = Join-Path $testRoot 'rollout.jsonl'
+        $prefix = '{"type":"response_item","payload":{"type":"message","content":"secret prompt"}}' + [Environment]::NewLine
+        [IO.File]::WriteAllText($transcript, $prefix, [Text.UTF8Encoding]::new($false))
+        $offset = [int64](Get-Item -LiteralPath $transcript).Length
+        Add-UsageRecord $transcript 'turn-a' 'turn-a' 'resp_root' 10 2 3 1
+        Add-UsageRecord $transcript 'turn-child' 'turn-a' 'resp_child' 20 4 5 0
+        Add-UsageRecord $transcript 'turn-b' 'turn-b' 'resp_other' 30 6 0 0
+        [IO.File]::AppendAllText($transcript, "not-json`r`n", [Text.UTF8Encoding]::new($false))
+
+        Assert-True ((Get-TranscriptLength $transcript) -gt $offset) 'Transcript length helper must observe appended records'
+        $actual = @(Read-TurnUsageRecords $transcript 'turn-a' $offset)
+        Assert-Equal 2 $actual.Count 'Root and child usage must be selected'
+        Assert-Equal 'resp_root' $actual[0].response_id 'Root response id must survive projection'
+        Assert-Equal 'resp_child' $actual[1].response_id 'Child response id must survive projection'
+        Assert-Equal 30 (($actual | Measure-Object input_tokens -Sum).Sum) 'Projected input tokens must sum'
+        Assert-True (-not (($actual | ConvertTo-Json -Depth 6) -match 'secret prompt')) 'Message text must not enter projections'
+
+        $deduplicated = @(Select-UniqueUsageRecords @($actual[0], $actual[0], $actual[1]))
+        Assert-Equal 2 $deduplicated.Count 'Response ids must deduplicate'
+        $tokens = Measure-ProjectedTokens $deduplicated
+        Assert-Equal 30 $tokens.input_tokens 'Projected input aggregation must work'
+        Assert-Equal 6 $tokens.output_tokens 'Projected output aggregation must work'
+        Assert-Equal 'resp_root' (Get-ResponseIdFromRequestId 'session:codex:provider:resp_root') 'CC Switch request id must expose response id'
+        Assert-True ($null -eq (Get-ResponseIdFromRequestId 'random-request-id')) 'Random request ids must not correlate'
+
+        $rows = @(
+            [pscustomobject]@{request_id='session:codex:p:resp_root';input_tokens=999},
+            [pscustomobject]@{request_id='session:codex:p:resp_other';input_tokens=888},
+            [pscustomobject]@{request_id='random-request-id';input_tokens=777}
+        )
+        $matched = @(Select-AttributedRows $rows $actual)
+        Assert-Equal 1 $matched.Count 'Only requested response ids must match'
+        Assert-Equal 'resp_root' $matched[0].attribution_response_id 'Matched row must retain its response id'
+    } finally {
+        Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-Collector {
     $testRoot = Join-Path $env:TEMP ('token-notifier-collector-' + [guid]::NewGuid().ToString('N'))
     $dbPath = Join-Path $testRoot 'cc-switch.db'
     $configPath = Join-Path $testRoot 'config.json'
     $capturePath = Join-Path $testRoot 'notification.json'
+    $transcriptPath = Join-Path $testRoot 'single-rollout.jsonl'
     New-Item -ItemType Directory -Force $testRoot | Out-Null
     try {
         $schema = @'
@@ -197,18 +273,20 @@ INSERT INTO proxy_request_logs (request_id,provider_id,app_type,model,status_cod
         $env:CCSWITCH_SETTLE_DELAY_MS = '0'
         $env:TOKENNOTIFIER_NOTIFIER_COMMAND = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $captureScript + '" -OutputPath "' + $capturePath + '"'
         $collector = Join-Path $repoRoot 'scripts\collector.ps1'
-        $startJson = @{hook_event_name='UserPromptSubmit';session_id='s';turn_id='t';cwd='C:\work'} | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($transcriptPath, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
+        $startJson = @{hook_event_name='UserPromptSubmit';session_id='s';turn_id='t';cwd='C:\work';transcript_path=$transcriptPath} | ConvertTo-Json -Compress
         Assert-Equal 0 (Invoke-CollectorProcess $collector $startJson).ExitCode 'Start Hook must succeed'
         $insert = @'
 INSERT INTO proxy_request_logs
 (request_id,provider_id,app_type,model,request_model,pricing_model,input_tokens,output_tokens,
  cache_read_tokens,cache_creation_tokens,input_cost_usd,output_cost_usd,cache_read_cost_usd,
  cache_creation_cost_usd,total_cost_usd,latency_ms,first_token_ms,duration_ms,status_code,created_at,data_source)
-VALUES ('r1','p','codex','m','m','m',1000,200,10,1,'0.01','0.02','0.002','0.001','0.033',1,7,900,200,2,'proxy');
+VALUES ('session:codex:p:resp_single','p','codex','m','m','m',1000,200,10,1,'0.01','0.02','0.002','0.001','0.033',1,7,900,200,2,'proxy');
 '@
         $insert | & sqlite3 $dbPath
         Assert-Equal 0 $LASTEXITCODE 'Fixture row must be inserted'
-        $stopJson = @{hook_event_name='Stop';session_id='s';turn_id='t';cwd='C:\work';last_assistant_message='secret answer'} | ConvertTo-Json -Compress
+        Add-UsageRecord $transcriptPath 't' 't' 'resp_single' 1000 200 10 1
+        $stopJson = @{hook_event_name='Stop';session_id='s';turn_id='t';cwd='C:\work';transcript_path=$transcriptPath;last_assistant_message='secret answer'} | ConvertTo-Json -Compress
         Assert-Equal 0 (Invoke-CollectorProcess $collector $stopJson).ExitCode 'Stop Hook must succeed'
         Assert-True (Wait-ForPath $capturePath) 'Detached notifier payload must be captured'
         $payload = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -219,7 +297,76 @@ VALUES ('r1','p','codex','m','m','m',1000,200,10,1,'0.01','0.02','0.002','0.001'
         Assert-True (-not $payload.PSObject.Properties.Name.Contains('max_visible')) 'WPF row limit must be removed'
         $logText = [IO.File]::ReadAllText((Join-Path $testRoot 'logs\usage.jsonl'), [Text.Encoding]::UTF8)
         Assert-True (-not $logText.Contains('secret answer')) 'Answer content must not be persisted'
-        Assert-True (-not (Test-Path (Join-Path $testRoot 'state\t.json'))) 'Marker must be removed'
+        Assert-True (-not (Test-Path (Join-Path $testRoot 'state\turns\t.json'))) 'Marker must be removed'
+
+        $transcriptA = Join-Path $testRoot 'turn-a.jsonl'
+        $transcriptB = Join-Path $testRoot 'turn-b.jsonl'
+        [IO.File]::WriteAllText($transcriptA, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($transcriptB, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
+        $startA = @{hook_event_name='UserPromptSubmit';session_id='session-a';turn_id='turn-a';cwd='C:\same-work';transcript_path=$transcriptA} | ConvertTo-Json -Compress
+        $startB = @{hook_event_name='UserPromptSubmit';session_id='session-b';turn_id='turn-b';cwd='C:\same-work';transcript_path=$transcriptB} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $startA).ExitCode 'Concurrent turn A must start'
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $startB).ExitCode 'Concurrent turn B must start'
+        Add-UsageRecord $transcriptA 'turn-a' 'turn-a' 'resp_a1' 100 10 5 0
+        Add-UsageRecord $transcriptA 'turn-a' 'turn-a' 'resp_a2' 200 20 10 0
+        Add-UsageRecord $transcriptB 'turn-b' 'turn-b' 'resp_b1' 900 90 50 0
+        $interleaved = @'
+INSERT INTO proxy_request_logs
+(request_id,provider_id,app_type,model,request_model,pricing_model,input_tokens,output_tokens,
+ cache_read_tokens,cache_creation_tokens,input_cost_usd,output_cost_usd,cache_read_cost_usd,
+ cache_creation_cost_usd,total_cost_usd,latency_ms,first_token_ms,duration_ms,status_code,created_at,data_source)
+VALUES
+('session:codex:p:resp_a1','p','codex','m','m','m',100,10,5,0,'0.01','0.02','0.001','0','0.031',100,20,300,200,3,'proxy'),
+('session:codex:p:resp_b1','p','codex','m','m','m',900,90,50,0,'0.09','0.18','0.01','0','0.28',200,30,500,200,4,'proxy'),
+('session:codex:p:resp_a2','p','codex','m','m','m',200,20,10,0,'0.02','0.04','0.002','0','0.062',110,21,310,200,5,'proxy');
+'@
+        $interleaved | & sqlite3 $dbPath
+        Assert-Equal 0 $LASTEXITCODE 'Interleaved fixture rows must be inserted'
+
+        Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
+        $stopA = @{hook_event_name='Stop';session_id='session-a';turn_id='turn-a';cwd='C:\same-work';transcript_path=$transcriptA} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $stopA).ExitCode 'Concurrent turn A must stop'
+        Assert-True (Wait-ForPath $capturePath) 'Turn A notification must be captured'
+        $payloadA = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-Equal '300' $payloadA.items[1].value 'Turn A must include only its own input tokens'
+        Assert-Equal '30' $payloadA.items[2].value 'Turn A must include only its own output tokens'
+
+        Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
+        $stopB = @{hook_event_name='Stop';session_id='session-b';turn_id='turn-b';cwd='C:\same-work';transcript_path=$transcriptB} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $stopB).ExitCode 'Concurrent turn B must stop'
+        Assert-True (Wait-ForPath $capturePath) 'Turn B notification must be captured'
+        $payloadB = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-Equal '900' $payloadB.items[1].value 'Turn B must include only its own input tokens'
+        Assert-Equal '90' $payloadB.items[2].value 'Turn B must include only its own output tokens'
+
+        $partialTranscript = Join-Path $testRoot 'turn-partial.jsonl'
+        [IO.File]::WriteAllText($partialTranscript, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
+        $partialStart = @{hook_event_name='UserPromptSubmit';session_id='session-partial';turn_id='turn-partial';cwd='C:\same-work';transcript_path=$partialTranscript} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $partialStart).ExitCode 'Partial turn must start'
+        Add-UsageRecord $partialTranscript 'turn-partial' 'turn-partial' 'resp_present' 30 3 2 0
+        Add-UsageRecord $partialTranscript 'turn-partial' 'turn-partial' 'resp_missing' 40 4 3 0
+        $partialRow = @'
+INSERT INTO proxy_request_logs
+(request_id,provider_id,app_type,model,request_model,pricing_model,input_tokens,output_tokens,
+ cache_read_tokens,cache_creation_tokens,input_cost_usd,output_cost_usd,cache_read_cost_usd,
+ cache_creation_cost_usd,total_cost_usd,latency_ms,first_token_ms,duration_ms,status_code,created_at,data_source)
+VALUES ('session:codex:p:resp_present','p','codex','m','m','m',30,3,2,0,'0.003','0.006','0.001','0','0.01',50,10,100,200,6,'proxy');
+'@
+        $partialRow | & sqlite3 $dbPath
+        Assert-Equal 0 $LASTEXITCODE 'Partial fixture row must be inserted'
+        Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
+        $partialStop = @{hook_event_name='Stop';session_id='session-partial';turn_id='turn-partial';cwd='C:\same-work';transcript_path=$partialTranscript} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $partialStop).ExitCode 'Partial turn must stop'
+        Assert-True (Wait-ForPath $capturePath) 'Partial notification must be captured'
+        $partialPayload = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-Equal '--' $partialPayload.items[0].value 'Partial cost must not look complete'
+        Assert-Equal '70' $partialPayload.items[1].value 'Partial token totals must come from rollout usage'
+        Assert-Equal '7' $partialPayload.items[2].value 'Partial output totals must come from rollout usage'
+        $summaries = @([IO.File]::ReadAllLines((Join-Path $testRoot 'logs\usage.jsonl'), [Text.Encoding]::UTF8) | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object type -eq 'turn_summary')
+        $partialSummary = $summaries | Where-Object codex_turn_id -eq 'turn-partial' | Select-Object -Last 1
+        Assert-Equal 'partial' $partialSummary.attribution_status 'Missing CC Switch rows must mark a partial turn'
+        Assert-Equal 1 ([int]$partialSummary.matched_request_count) 'Partial summary must count matched requests'
+        Assert-Equal 1 ([int]$partialSummary.unmatched_request_count) 'Partial summary must count unmatched requests'
     } finally {
         Remove-Item Env:CCSWITCH_DB_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:TOKENNOTIFIER_DATA_ROOT -ErrorAction SilentlyContinue
@@ -235,4 +382,5 @@ if ($Case -in @('All', 'Config')) { Test-Config; Write-Output 'PASS: Config' }
 if ($Case -in @('All', 'Evaluator')) { Test-Evaluator; Write-Output 'PASS: Evaluator' }
 if ($Case -in @('All', 'ToastXml')) { Test-ToastXml; Write-Output 'PASS: ToastXml' }
 if ($Case -in @('All', 'Registration')) { Test-Registration; Write-Output 'PASS: Registration' }
+if ($Case -in @('All', 'Attribution')) { Test-Attribution; Write-Output 'PASS: Attribution' }
 if ($Case -in @('All', 'Collector')) { Test-Collector; Write-Output 'PASS: Collector' }
