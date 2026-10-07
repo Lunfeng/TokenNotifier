@@ -97,7 +97,24 @@ function Start-Turn([object]$Payload) {
 
 function Append-JsonLine([object]$Value, [string]$Path) {
     New-Item -ItemType Directory -Force (Split-Path -Parent $Path) | Out-Null
-    [IO.File]::AppendAllText($Path, (($Value | ConvertTo-Json -Compress -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+    $fullPath = [IO.Path]::GetFullPath($Path).ToLowerInvariant()
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = [BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($fullPath))).Replace('-', '')
+    } finally {
+        $sha256.Dispose()
+    }
+    $mutex = New-Object Threading.Mutex($false, ('Local\Lunfeng.TokenNotifier.Jsonl.' + $hash))
+    $acquired = $false
+    try {
+        try { $acquired = $mutex.WaitOne(5000) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) { throw 'Timed out waiting to append the TokenNotifier usage log' }
+        [IO.File]::AppendAllText($Path, (($Value | ConvertTo-Json -Compress -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+    } finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
 }
 
 function ConvertTo-EvaluatorContext([object]$Context) {

@@ -30,7 +30,7 @@ function Wait-ForPath([string]$Path, [int]$TimeoutMilliseconds = 5000) {
 
 function Test-Package {
     $manifest = Get-Content -Raw -Encoding UTF8 (Join-Path $repoRoot '.codex-plugin\plugin.json') | ConvertFrom-Json
-    Assert-Equal '0.2.0' $manifest.version 'Toast release version must be 0.2.0'
+    Assert-Equal '0.3.0' $manifest.version 'Concurrent attribution release version must be 0.3.0'
     $iconPath = Join-Path $repoRoot 'assets\token-notifier.ico'
     Assert-True (Test-Path $iconPath) 'Toast icon must be packaged'
     $iconBytes = [IO.File]::ReadAllBytes($iconPath)
@@ -41,6 +41,12 @@ function Test-Package {
     Assert-True $readme.Contains('"duration": "short"') 'README must document Toast duration'
     Assert-True $readme.Contains('unregister-toast.ps1') 'README must document cleanup'
     Assert-True $readme.Contains('Windows may truncate') 'README must disclose Toast truncation'
+    Assert-True ($readme -match 'concurrent Codex turns') 'README must document concurrent turn attribution'
+    Assert-True (-not $readme.Contains('One active Codex turn at a time')) 'README must remove the single-active-turn limitation'
+    Assert-True $readme.Contains('SubagentStop') 'README must document subagent aggregation'
+    Assert-True $readme.Contains('Interrupt') 'README must document interrupted reminders'
+    Assert-True $readme.Contains('TOKENNOTIFIER_SETTLE_TIMEOUT_MS') 'README must document the attribution settle timeout'
+    Assert-True $readme.Contains('TOKENNOTIFIER_SETTLE_INTERVAL_MS') 'README must document the attribution polling interval'
     $hooks = Get-Content -Raw -Encoding UTF8 (Join-Path $repoRoot 'hooks\hooks.json') | ConvertFrom-Json
     Assert-Equal 1 @($hooks.hooks.UserPromptSubmit).Count 'UserPromptSubmit Hook must exist'
     Assert-Equal 1 @($hooks.hooks.SubagentStop).Count 'SubagentStop Hook must exist'
@@ -308,9 +314,38 @@ INSERT INTO proxy_request_logs (request_id,provider_id,app_type,model,status_cod
         )
         [IO.File]::WriteAllLines($sessionIndex, $sessionIndexLines, [Text.UTF8Encoding]::new($false))
         $collector = Join-Path $repoRoot 'scripts\collector.ps1'
+
+        $appendWorker = Join-Path $testRoot 'append-worker.ps1'
+        $appendWorkerSource = @'
+param([int]$Id)
+. $env:TOKENNOTIFIER_APPEND_COLLECTOR
+for ($index = 0; $index -lt 20; $index++) {
+    Append-JsonLine ([ordered]@{type='concurrent_append';worker=$Id;index=$index}) $env:TOKENNOTIFIER_APPEND_PATH
+}
+'@
+        [IO.File]::WriteAllText($appendWorker, $appendWorkerSource, [Text.UTF8Encoding]::new($false))
+        $concurrentLog = Join-Path $testRoot 'concurrent-append.jsonl'
+        $env:TOKENNOTIFIER_APPEND_COLLECTOR = $collector
+        $env:TOKENNOTIFIER_APPEND_PATH = $concurrentLog
+        $appendProcesses = @()
+        foreach ($workerId in 1..8) {
+            $appendProcesses += Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $appendWorker + '"'), '-Id', [string]$workerId
+            )
+        }
+        foreach ($appendProcess in $appendProcesses) {
+            $appendProcess.WaitForExit()
+            Assert-Equal 0 $appendProcess.ExitCode 'Concurrent JSONL append worker must succeed'
+            $appendProcess.Dispose()
+        }
+        $concurrentEntries = @([IO.File]::ReadAllLines($concurrentLog, [Text.Encoding]::UTF8) | ForEach-Object { $_ | ConvertFrom-Json })
+        Assert-Equal 160 $concurrentEntries.Count 'Concurrent JSONL appends must retain every complete record'
+
         [IO.File]::WriteAllText($transcriptPath, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
         $startJson = @{hook_event_name='UserPromptSubmit';session_id='s';turn_id='t';cwd='C:\work';transcript_path=$transcriptPath} | ConvertTo-Json -Compress
         Assert-Equal 0 (Invoke-CollectorProcess $collector $startJson).ExitCode 'Start Hook must succeed'
+        [IO.File]::AppendAllText($transcriptPath, ('{"type":"response_item","payload":{"type":"message","content":"secret prompt"}}' + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        [IO.File]::AppendAllText($transcriptPath, ('{"type":"response_item","payload":{"type":"tool_result","output":"secret tool output"}}' + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
         $insert = @'
 INSERT INTO proxy_request_logs
 (request_id,provider_id,app_type,model,request_model,pricing_model,input_tokens,output_tokens,
@@ -321,7 +356,7 @@ VALUES ('session:codex:p:resp_single','p','codex','m','m','m',1000,200,10,1,'0.0
         $insert | & sqlite3 $dbPath
         Assert-Equal 0 $LASTEXITCODE 'Fixture row must be inserted'
         Add-UsageRecord $transcriptPath 't' 't' 'resp_single' 1000 200 10 1
-        $stopJson = @{hook_event_name='Stop';session_id='s';turn_id='t';cwd='C:\work';transcript_path=$transcriptPath;last_assistant_message='secret answer'} | ConvertTo-Json -Compress
+        $stopJson = @{hook_event_name='Stop';session_id='s';turn_id='t';cwd='C:\work';transcript_path=$transcriptPath;prompt='secret prompt';last_assistant_message='secret answer';tool_output='secret tool output'} | ConvertTo-Json -Compress
         Assert-Equal 0 (Invoke-CollectorProcess $collector $stopJson).ExitCode 'Stop Hook must succeed'
         Assert-True (Wait-ForPath $capturePath) 'Detached notifier payload must be captured'
         $payload = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -332,6 +367,13 @@ VALUES ('session:codex:p:resp_single','p','codex','m','m','m',1000,200,10,1,'0.0
         Assert-True (-not $payload.PSObject.Properties.Name.Contains('max_visible')) 'WPF row limit must be removed'
         $logText = [IO.File]::ReadAllText((Join-Path $testRoot 'logs\usage.jsonl'), [Text.Encoding]::UTF8)
         Assert-True (-not $logText.Contains('secret answer')) 'Answer content must not be persisted'
+        Assert-True (-not $logText.Contains('secret prompt')) 'Prompt content must not be persisted'
+        Assert-True (-not $logText.Contains('secret tool output')) 'Tool output must not be persisted'
+        $initialSummary = @($logText -split "`r?`n" | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object type -eq 'turn_summary' | Select-Object -Last 1)[0]
+        foreach ($field in @('turn_outcome', 'attribution_status', 'matched_request_count', 'unmatched_request_count')) {
+            Assert-True ($initialSummary.PSObject.Properties.Name -contains $field) ("Turn summary must contain " + $field)
+        }
+        Assert-True ($initialSummary.PSObject.Properties.Name -notcontains 'thread_name') 'Thread names must not be persisted in summaries'
         Assert-True (-not (Test-Path (Join-Path $testRoot 'state\turns\t.json'))) 'Marker must be removed'
 
         $transcriptA = Join-Path $testRoot 'turn-a.jsonl'
@@ -418,11 +460,14 @@ VALUES ('session:codex:p:resp_present','p','codex','m','m','m',30,3,2,0,'0.003',
         Add-UsageRecord $rootTranscript 'child-turn' 'root-turn' 'resp_child_turn' 70 7 6 0
         Add-UsageRecord $agentTranscript 'child-turn' 'root-turn' 'resp_child_turn' 70 7 6 0
         Add-UsageRecord $agentTranscript 'child-turn' 'root-turn' 'resp_child_turn_2' 30 3 2 0
+        [IO.File]::AppendAllText($agentTranscript, ('{"type":"response_item","payload":{"type":"tool_result","output":"secret tool output"}}' + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
         Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
-        $subagentStop = @{hook_event_name='SubagentStop';session_id='session-agent-root';turn_id='child-turn';agent_id='agent-1';agent_type='worker';agent_transcript_path=$agentTranscript} | ConvertTo-Json -Compress
+        $subagentStop = @{hook_event_name='SubagentStop';session_id='session-agent-root';turn_id='child-turn';agent_id='agent-1';agent_type='worker';agent_transcript_path=$agentTranscript;last_assistant_message='secret answer';tool_output='secret tool output'} | ConvertTo-Json -Compress
         Assert-Equal 0 (Invoke-CollectorProcess $collector $subagentStop).ExitCode 'SubagentStop Hook must succeed'
         Assert-True (-not (Test-Path -LiteralPath $capturePath)) 'SubagentStop must not notify independently'
         Assert-True (Test-Path -LiteralPath (Join-Path $testRoot 'state\subagents\root-turn\agent-1.json')) 'Subagent usage fragment must be persisted'
+        $fragmentText = [IO.File]::ReadAllText((Join-Path $testRoot 'state\subagents\root-turn\agent-1.json'), [Text.Encoding]::UTF8)
+        Assert-True (-not $fragmentText.Contains('secret tool output')) 'Subagent fragments must contain only usage projections'
         $agentRows = @'
 INSERT INTO proxy_request_logs
 (request_id,provider_id,app_type,model,request_model,pricing_model,input_tokens,output_tokens,
@@ -479,12 +524,26 @@ VALUES ('session:codex:p:resp_interrupted','p','codex','m','m','m',25,2,1,0,'0.0
         $unavailablePayload = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
         Assert-Equal '任务已完成；本回合用量暂不可用。' $unavailablePayload.message 'Unavailable notification must be explicit'
         Assert-Equal 0 @($unavailablePayload.items).Count 'Unavailable notification must not render misleading metric rows'
+
+        $persistedText = ''
+        foreach ($directory in @((Join-Path $testRoot 'state'), (Join-Path $testRoot 'logs'))) {
+            if (-not (Test-Path -LiteralPath $directory -PathType Container)) { continue }
+            foreach ($file in @(Get-ChildItem -LiteralPath $directory -Recurse -File)) {
+                $persistedText += [IO.File]::ReadAllText($file.FullName, [Text.Encoding]::UTF8)
+            }
+        }
+        foreach ($secret in @('secret prompt', 'secret answer', 'secret tool output')) {
+            Assert-True (-not $persistedText.Contains($secret)) ("Runtime state and logs must not persist " + $secret)
+        }
+        Assert-True (-not $persistedText.Contains('Concurrent task A')) 'Thread names must remain transient notification data'
     } finally {
         Remove-Item Env:CCSWITCH_DB_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:TOKENNOTIFIER_DATA_ROOT -ErrorAction SilentlyContinue
         Remove-Item Env:TOKENNOTIFIER_CONFIG_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:CCSWITCH_SETTLE_DELAY_MS -ErrorAction SilentlyContinue
         Remove-Item Env:TOKENNOTIFIER_NOTIFIER_COMMAND -ErrorAction SilentlyContinue
+        Remove-Item Env:TOKENNOTIFIER_APPEND_COLLECTOR -ErrorAction SilentlyContinue
+        Remove-Item Env:TOKENNOTIFIER_APPEND_PATH -ErrorAction SilentlyContinue
         $env:USERPROFILE = $originalUserProfile
         Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

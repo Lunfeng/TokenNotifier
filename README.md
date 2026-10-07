@@ -1,8 +1,9 @@
 # TokenNotifier
 
-TokenNotifier is a Windows 10/11 Codex plugin that reads CC Switch usage
-records after each completed answer and displays configurable token, cost,
-latency, and calculated metrics in a native Windows Adaptive Toast.
+TokenNotifier is a Windows 10/11 Codex plugin that correlates Codex rollout
+usage with CC Switch records after each completed or interrupted turn. It
+displays configurable token, cost, latency, and calculated metrics in a native
+Windows Adaptive Toast.
 
 ## Install From GitHub
 
@@ -13,20 +14,46 @@ plugin directory:
 https://github.com/Lunfeng/TokenNotifier.git
 ```
 
-Review and trust the plugin Hooks when Codex asks. The package registers
-`UserPromptSubmit` and `Stop`.
+Review and trust the plugin Hooks when Codex asks. The package registers four
+Hooks: `UserPromptSubmit`, `SubagentStop`, `Stop`, and `Interrupt`.
 
 ## Requirements
 
 - Windows 10 or Windows 11.
 - Windows PowerShell 5.1.
 - Codex desktop app or Codex CLI with local plugin Hooks enabled.
-- CC Switch routing enabled and its usage database readable.
+- CC Switch 3.20.4 or later, with routing enabled and its usage database
+  readable.
 - `sqlite3.exe` available on `PATH`.
-- One active Codex turn at a time when exact per-turn attribution matters.
 
 The plugin has no PowerShell Gallery, Node.js, Python, .NET SDK, packaged-app,
 administrator, or resident-process dependency.
+
+## Concurrent Attribution
+
+Concurrent Codex turns are attributed independently. TokenNotifier reads the
+minimal response ID and numeric usage projection from each local Codex rollout,
+then joins those IDs to CC Switch `request_id` values. Database row timing is
+only a query bound and is never used as an attribution guess.
+
+Subagent usage is collected on `SubagentStop` and folded into its root turn.
+It does not create a separate notification. Both `Stop` and `Interrupt` create
+one root-turn reminder; interrupted reminders are explicitly marked.
+
+Notifications report one of three attribution states:
+
+- Exact: every rollout response ID matched CC Switch, so token, cost, provider,
+  and latency fields are available.
+- Partial: rollout token totals are complete, but one or more CC Switch rows are
+  missing. The Toast names the missing count and cost/provider/latency fields
+  render as `--`.
+- Unavailable: no usable rollout usage record was found. The Toast still
+  appears with a clear status message and no metric rows.
+
+The default Toast title is `TokenNotifier · <thread name>` so overlapping work
+can be distinguished. A configured `title` still overrides it. A future Codex
+rollout format change can temporarily degrade a turn to unavailable until the
+parser is updated; TokenNotifier will not fall back to timing-only attribution.
 
 ## Toast Registration
 
@@ -115,15 +142,23 @@ provided. Otherwise data is stored under:
 %USERPROFILE%\.codex\token-notifier
 ```
 
-`usage.jsonl` contains request and turn summaries. `errors.log` contains
+`usage.jsonl` contains matched request records, minimal unmatched response-ID
+and numeric usage records, and turn summaries. `errors.log` contains
 non-blocking collection, configuration, registration, or Toast failures. The
-plugin does not persist prompt text, answer text, API keys, or provider response
-bodies.
+plugin reads and stores only the minimum identifiers and numeric usage needed
+for correlation. It does not persist prompt text, answer text, reasoning, tool
+input, tool output, raw transcript lines, thread names, API keys, or provider
+response bodies.
 
 `TOKENNOTIFIER_DATA_ROOT`, `TOKENNOTIFIER_CONFIG_PATH`, and
 `TOKENNOTIFIER_NOTIFIER_COMMAND` can override local paths or the notifier
 command. The former `APINOTIFIER_*` variables remain accepted as migration
 aliases.
+
+`TOKENNOTIFIER_SETTLE_TIMEOUT_MS` controls how long a completing Hook waits for
+matching CC Switch rows (default `1000` ms), and
+`TOKENNOTIFIER_SETTLE_INTERVAL_MS` controls the polling interval (default
+`100` ms). The legacy `CCSWITCH_SETTLE_DELAY_MS` remains a timeout alias.
 
 If an older project-local Hook still invokes ApiNotifier, disable that Hook
 before installing this package so each event is handled once.

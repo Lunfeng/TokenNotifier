@@ -1,6 +1,6 @@
 {
   "name": "token-notifier",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Show CC Switch token usage and cost after each Codex answer.",
   "author": {
     "name": "Lunfeng"
