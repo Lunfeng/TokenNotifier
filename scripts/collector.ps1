@@ -147,21 +147,23 @@ function New-ErrorNotification([string]$Message) {
 function Invoke-UsageNotification([object]$Config, [object]$Context) {
     $items = @()
     $evaluatorContext = ConvertTo-EvaluatorContext $Context
-    foreach ($item in @($Config.items)) {
-        $resolved = Resolve-DataItem $item $evaluatorContext
-        $items += $resolved
-        if ($resolved.PSObject.Properties.Name -contains 'error') {
-            try { Append-ErrorLog 'Data item evaluation failed' } catch { }
+    if ([string]$Context.attribution_status -ne 'unavailable') {
+        foreach ($item in @($Config.items)) {
+            $resolved = Resolve-DataItem $item $evaluatorContext
+            $items += $resolved
+            if ($resolved.PSObject.Properties.Name -contains 'error') {
+                try { Append-ErrorLog 'Data item evaluation failed' } catch { }
+            }
         }
     }
     if ($script:ConfigLoadError) {
         $items += [pscustomobject]@{ label = 'Config error'; value = 'Using default config'; error = $script:ConfigLoadError }
     }
-    $defaultTitle = 'TokenNotifier'
-    if ([string]$Context.model -and [string]$Context.model -ne 'multiple') { $defaultTitle = 'TokenNotifier ' + [char]0x00B7 + ' ' + [string]$Context.model }
+    $defaultTitle = 'TokenNotifier ' + [char]0x00B7 + ' ' + [string]$Context.thread_name
     $payload = [ordered]@{
         kind = 'usage'
         title = if ([string]::IsNullOrWhiteSpace([string]$Config.title)) { $defaultTitle } else { [string]$Config.title }
+        message = Get-AttributionMessage ([string]$Context.turn_outcome) ([string]$Context.attribution_status) ([int]$Context.unmatched_request_count)
         items = $items
         duration = Get-ToastDuration $Config
     }
@@ -226,7 +228,7 @@ function Build-AttributedTurnContext([object[]]$UsageRecords, [object[]]$Rows, [
         status_code = if ($statuses.Count -eq 1) { $statuses[0] } elseif ($statuses.Count -gt 1) { 'multiple' } else { $null }
         turn_outcome = $Outcome
         attribution_status = $attributionStatus
-        thread_name = $null
+        thread_name = Get-ThreadDisplayName ([string]$Marker.session_id) ([string]$Marker.cwd) ''
         codex_session_id = [string]$Marker.session_id
         codex_turn_id = [string]$Marker.turn_id
         codex_cwd = [string]$Marker.cwd

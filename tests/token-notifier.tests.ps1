@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet('All', 'Package', 'Config', 'Evaluator', 'ToastXml', 'Registration', 'Attribution', 'Collector')]
     [string]$Case = 'All'
 )
@@ -232,6 +232,24 @@ function Test-Attribution {
         $matched = @(Select-AttributedRows $rows $actual)
         Assert-Equal 1 $matched.Count 'Only requested response ids must match'
         Assert-Equal 'resp_root' $matched[0].attribution_response_id 'Matched row must retain its response id'
+
+        $sessionIndex = Join-Path $testRoot 'session_index.jsonl'
+        $indexEntries = @(
+            '{"id":"session-a","thread_name":"Concurrent task A"}'
+            '{"id":"session-b","thread_name":"Concurrent task B"}'
+        )
+        [IO.File]::WriteAllLines($sessionIndex, $indexEntries, [Text.UTF8Encoding]::new($false))
+        Assert-Equal 'Concurrent task A' (Get-ThreadDisplayName 'session-a' 'C:\same-work' $sessionIndex) 'Session id must select the exact thread name'
+        Assert-Equal 'same-work' (Get-ThreadDisplayName 'session-missing' 'C:\same-work' $sessionIndex) 'Missing session must fall back to the cwd leaf'
+        Assert-Equal '12345678' (Get-ThreadDisplayName '1234567890' '' $sessionIndex) 'Missing cwd must fall back to a short session id'
+        Assert-Equal 'TokenNotifier' (Get-ThreadDisplayName '' '' $sessionIndex) 'Missing identity must use the product name'
+
+        Assert-Equal '' (Get-AttributionMessage 'completed' 'exact' 0) 'Completed exact copy must be empty'
+        Assert-Equal '任务已中断。' (Get-AttributionMessage 'interrupted' 'exact' 0) 'Interrupted exact copy must be explicit'
+        Assert-Equal '部分数据：2 个请求缺少 CCSwitch 成本信息。' (Get-AttributionMessage 'completed' 'partial' 2) 'Partial copy must include the count'
+        Assert-Equal '任务已中断；部分数据：2 个请求缺少 CCSwitch 成本信息。' (Get-AttributionMessage 'interrupted' 'partial' 2) 'Interrupted partial copy must include outcome and count'
+        Assert-Equal '任务已完成；本回合用量暂不可用。' (Get-AttributionMessage 'completed' 'unavailable' 0) 'Unavailable completion copy must be explicit'
+        Assert-Equal '任务已中断；本回合用量暂不可用。' (Get-AttributionMessage 'interrupted' 'unavailable' 0) 'Unavailable interrupt copy must be explicit'
     } finally {
         Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -239,6 +257,7 @@ function Test-Attribution {
 
 function Test-Collector {
     $testRoot = Join-Path $env:TEMP ('token-notifier-collector-' + [guid]::NewGuid().ToString('N'))
+    $originalUserProfile = $env:USERPROFILE
     $dbPath = Join-Path $testRoot 'cc-switch.db'
     $configPath = Join-Path $testRoot 'config.json'
     $capturePath = Join-Path $testRoot 'notification.json'
@@ -279,6 +298,15 @@ INSERT INTO proxy_request_logs (request_id,provider_id,app_type,model,status_cod
         $env:TOKENNOTIFIER_CONFIG_PATH = $configPath
         $env:CCSWITCH_SETTLE_DELAY_MS = '0'
         $env:TOKENNOTIFIER_NOTIFIER_COMMAND = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $captureScript + '" -OutputPath "' + $capturePath + '"'
+        $env:USERPROFILE = $testRoot
+        $sessionIndexDirectory = Join-Path $testRoot '.codex'
+        New-Item -ItemType Directory -Force $sessionIndexDirectory | Out-Null
+        $sessionIndex = Join-Path $sessionIndexDirectory 'session_index.jsonl'
+        $sessionIndexLines = @(
+            '{"id":"session-a","thread_name":"Concurrent task A"}'
+            '{"id":"session-b","thread_name":"Concurrent task B"}'
+        )
+        [IO.File]::WriteAllLines($sessionIndex, $sessionIndexLines, [Text.UTF8Encoding]::new($false))
         $collector = Join-Path $repoRoot 'scripts\collector.ps1'
         [IO.File]::WriteAllText($transcriptPath, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
         $startJson = @{hook_event_name='UserPromptSubmit';session_id='s';turn_id='t';cwd='C:\work';transcript_path=$transcriptPath} | ConvertTo-Json -Compress
@@ -335,14 +363,18 @@ VALUES
         Assert-Equal 0 (Invoke-CollectorProcess $collector $stopA).ExitCode 'Concurrent turn A must stop'
         Assert-True (Wait-ForPath $capturePath) 'Turn A notification must be captured'
         $payloadA = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-Equal ('TokenNotifier ' + [char]0x00B7 + ' Concurrent task A') $payloadA.title 'Default title must identify the concurrent thread'
         Assert-Equal '300' $payloadA.items[1].value 'Turn A must include only its own input tokens'
         Assert-Equal '30' $payloadA.items[2].value 'Turn A must include only its own output tokens'
 
+        $config.title = 'Configured title'
+        [IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
         Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
         $stopB = @{hook_event_name='Stop';session_id='session-b';turn_id='turn-b';cwd='C:\same-work';transcript_path=$transcriptB} | ConvertTo-Json -Compress
         Assert-Equal 0 (Invoke-CollectorProcess $collector $stopB).ExitCode 'Concurrent turn B must stop'
         Assert-True (Wait-ForPath $capturePath) 'Turn B notification must be captured'
         $payloadB = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-Equal 'Configured title' $payloadB.title 'Configured title must override the generated thread title'
         Assert-Equal '900' $payloadB.items[1].value 'Turn B must include only its own input tokens'
         Assert-Equal '90' $payloadB.items[2].value 'Turn B must include only its own output tokens'
 
@@ -366,6 +398,7 @@ VALUES ('session:codex:p:resp_present','p','codex','m','m','m',30,3,2,0,'0.003',
         Assert-Equal 0 (Invoke-CollectorProcess $collector $partialStop).ExitCode 'Partial turn must stop'
         Assert-True (Wait-ForPath $capturePath) 'Partial notification must be captured'
         $partialPayload = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-Equal '部分数据：1 个请求缺少 CCSwitch 成本信息。' $partialPayload.message 'Partial notification must visibly identify missing cost data'
         Assert-Equal '--' $partialPayload.items[0].value 'Partial cost must not look complete'
         Assert-Equal '70' $partialPayload.items[1].value 'Partial token totals must come from rollout usage'
         Assert-Equal '7' $partialPayload.items[2].value 'Partial output totals must come from rollout usage'
@@ -428,16 +461,31 @@ VALUES ('session:codex:p:resp_interrupted','p','codex','m','m','m',25,2,1,0,'0.0
         $interrupt = @{hook_event_name='Interrupt';session_id='session-interrupt';turn_id='turn-interrupt';cwd='C:\interrupt';transcript_path=$interruptTranscript} | ConvertTo-Json -Compress
         Assert-Equal 0 (Invoke-CollectorProcess $collector $interrupt).ExitCode 'Interrupt Hook must succeed'
         Assert-True (Wait-ForPath $capturePath) 'Interrupted notification must be captured'
+        $interruptPayload = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-Equal '任务已中断。' $interruptPayload.message 'Interrupted notification must state its outcome'
         $allSummaries = @([IO.File]::ReadAllLines((Join-Path $testRoot 'logs\usage.jsonl'), [Text.Encoding]::UTF8) | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object type -eq 'turn_summary')
         $interruptSummary = $allSummaries | Where-Object codex_turn_id -eq 'turn-interrupt' | Select-Object -Last 1
         Assert-Equal 'interrupted' $interruptSummary.turn_outcome 'Interrupt summary must retain its outcome'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $testRoot 'state\turns\turn-interrupt.json'))) 'Interrupt must remove its marker'
+
+        $unavailableTranscript = Join-Path $testRoot 'unavailable-turn.jsonl'
+        [IO.File]::WriteAllText($unavailableTranscript, "{`"type`":`"session_meta`"}`r`n", [Text.UTF8Encoding]::new($false))
+        $unavailableStart = @{hook_event_name='UserPromptSubmit';session_id='session-unavailable';turn_id='turn-unavailable';cwd='C:\unavailable';transcript_path=$unavailableTranscript} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $unavailableStart).ExitCode 'Unavailable turn must start'
+        Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
+        $unavailableStop = @{hook_event_name='Stop';session_id='session-unavailable';turn_id='turn-unavailable';cwd='C:\unavailable';transcript_path=$unavailableTranscript} | ConvertTo-Json -Compress
+        Assert-Equal 0 (Invoke-CollectorProcess $collector $unavailableStop).ExitCode 'Unavailable turn must stop without becoming an error'
+        Assert-True (Wait-ForPath $capturePath) 'Unavailable usage must still notify'
+        $unavailablePayload = [IO.File]::ReadAllText($capturePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        Assert-Equal '任务已完成；本回合用量暂不可用。' $unavailablePayload.message 'Unavailable notification must be explicit'
+        Assert-Equal 0 @($unavailablePayload.items).Count 'Unavailable notification must not render misleading metric rows'
     } finally {
         Remove-Item Env:CCSWITCH_DB_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:TOKENNOTIFIER_DATA_ROOT -ErrorAction SilentlyContinue
         Remove-Item Env:TOKENNOTIFIER_CONFIG_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:CCSWITCH_SETTLE_DELAY_MS -ErrorAction SilentlyContinue
         Remove-Item Env:TOKENNOTIFIER_NOTIFIER_COMMAND -ErrorAction SilentlyContinue
+        $env:USERPROFILE = $originalUserProfile
         Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

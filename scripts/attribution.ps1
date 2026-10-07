@@ -1,4 +1,4 @@
-function Get-TranscriptLength([string]$Path) {
+﻿function Get-TranscriptLength([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return [int64]0
     }
@@ -121,4 +121,40 @@ function Select-AttributedRows([object[]]$Rows, [object[]]$UsageRecords) {
         $row | Add-Member -NotePropertyName attribution_response_id -NotePropertyValue $responseId -Force
         Write-Output $row
     }
+}
+
+function Get-ThreadDisplayName([string]$SessionId, [string]$Cwd, [string]$IndexPath) {
+    if ([string]::IsNullOrWhiteSpace($IndexPath)) {
+        $IndexPath = Join-Path $env:USERPROFILE '.codex\session_index.jsonl'
+    }
+    if (Test-Path -LiteralPath $IndexPath -PathType Leaf) {
+        foreach ($line in [IO.File]::ReadLines($IndexPath, [Text.Encoding]::UTF8)) {
+            try { $entry = $line | ConvertFrom-Json } catch { continue }
+            if ([string]$entry.id -eq $SessionId -and -not [string]::IsNullOrWhiteSpace([string]$entry.thread_name)) {
+                return [string]$entry.thread_name
+            }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Cwd)) {
+        $leaf = Split-Path -Leaf $Cwd.TrimEnd('\', '/')
+        if (-not [string]::IsNullOrWhiteSpace($leaf)) { return $leaf }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
+        return $SessionId.Substring(0, [Math]::Min(8, $SessionId.Length))
+    }
+    return 'TokenNotifier'
+}
+
+function Get-AttributionMessage([string]$Outcome, [string]$Status, [int]$UnmatchedCount) {
+    if ($Status -eq 'unavailable') {
+        if ($Outcome -eq 'interrupted') { return '任务已中断；本回合用量暂不可用。' }
+        return '任务已完成；本回合用量暂不可用。'
+    }
+    if ($Status -eq 'partial') {
+        $partial = '部分数据：' + $UnmatchedCount + ' 个请求缺少 CCSwitch 成本信息。'
+        if ($Outcome -eq 'interrupted') { return '任务已中断；' + $partial }
+        return $partial
+    }
+    if ($Outcome -eq 'interrupted') { return '任务已中断。' }
+    return ''
 }
