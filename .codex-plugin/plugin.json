@@ -1,6 +1,6 @@
 {
   "name": "token-notifier",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Show CC Switch token usage and cost after each Codex answer.",
   "author": {
     "name": "Lunfeng"
@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "TokenNotifier",
     "shortDescription": "Show token usage and cost after each Codex answer",
-    "longDescription": "A Windows 10/11 Codex plugin that reads CC Switch usage records and displays configurable token, cost, latency, and calculated metrics after each completed answer.",
+    "longDescription": "A Windows 10/11 Codex plugin that reads CC Switch usage records and displays configurable token, cost, latency, and calculated metrics in native Windows notifications after each completed answer.",
     "developerName": "Lunfeng",
     "category": "Developer Tools",
     "capabilities": [

@@ -1,10 +1,7 @@
 {
   "enabled": true,
-  "popup": {
-    "position": "bottom-right",
-    "auto_close_seconds": 8,
-    "max_visible": 3,
-    "always_on_top": true
+  "toast": {
+    "duration": "short"
   },
   "items": [
     { "label": "费用", "field": "total_cost_usd", "format": "currency_usd" },

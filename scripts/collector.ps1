@@ -22,6 +22,23 @@ function Read-Utf8Stdin {
     finally { $memory.Dispose() }
 }
 
+function Get-ToastDuration([object]$Config) {
+    if ($null -ne $Config.toast -and $Config.toast -isnot [pscustomobject]) {
+        throw 'Config toast must be an object'
+    }
+    if ($null -ne $Config.toast -and $null -ne $Config.toast.duration) {
+        $duration = [string]$Config.toast.duration
+        if ($duration -notin @('short', 'long')) { throw 'Config toast duration must be short or long' }
+        return $duration
+    }
+    if ($null -ne $Config.popup -and $null -ne $Config.popup.auto_close_seconds) {
+        try { $seconds = [int]$Config.popup.auto_close_seconds }
+        catch { throw 'Config popup auto_close_seconds must be an integer' }
+        if ($seconds -ge 10) { return 'long' }
+    }
+    return 'short'
+}
+
 function Get-Config {
     $script:ConfigLoadError = $null
     $path = if ($env:TOKENNOTIFIER_CONFIG_PATH) { $env:TOKENNOTIFIER_CONFIG_PATH } elseif ($env:APINOTIFIER_CONFIG_PATH) { $env:APINOTIFIER_CONFIG_PATH } else { Join-Path $env:USERPROFILE '.codex\token-notifier\config.json' }
@@ -37,11 +54,7 @@ function Get-Config {
             if ($hasField -eq $hasExpression) { throw 'Config items require exactly one field or expression' }
         }
         if ($null -ne $config.popup -and $config.popup -isnot [pscustomobject]) { throw 'Config popup must be an object' }
-        if ($null -ne $config.popup.max_visible -and [int]$config.popup.max_visible -lt 1) { throw 'Config popup max_visible must be positive' }
-        if ($null -ne $config.popup.auto_close_seconds) {
-            try { $autoClose = [int]$config.popup.auto_close_seconds } catch { throw 'Config popup auto_close_seconds must be an integer' }
-            if ($autoClose -lt 1) { throw 'Config popup auto_close_seconds must be positive' }
-        }
+        Get-ToastDuration $config | Out-Null
         return $config
     } catch {
         $script:ConfigLoadError = $_.Exception.Message
@@ -115,7 +128,7 @@ function Invoke-DetachedNotifier([object]$Payload) {
 }
 
 function New-ErrorNotification([string]$Message) {
-    return [ordered]@{ kind = 'error'; title = 'TokenNotifier'; message = $Message; items = @(); auto_close_seconds = 8; max_visible = 3 }
+    return [ordered]@{ kind = 'error'; title = 'TokenNotifier'; message = $Message; items = @(); duration = 'short' }
 }
 
 function Invoke-UsageNotification([object]$Config, [object]$Context) {
@@ -131,15 +144,13 @@ function Invoke-UsageNotification([object]$Config, [object]$Context) {
     if ($script:ConfigLoadError) {
         $items += [pscustomobject]@{ label = 'Config error'; value = 'Using default config'; error = $script:ConfigLoadError }
     }
-    $popup = $Config.popup
     $defaultTitle = 'TokenNotifier'
     if ([string]$Context.model -and [string]$Context.model -ne 'multiple') { $defaultTitle = 'TokenNotifier ' + [char]0x00B7 + ' ' + [string]$Context.model }
     $payload = [ordered]@{
         kind = 'usage'
         title = if ([string]::IsNullOrWhiteSpace([string]$Config.title)) { $defaultTitle } else { [string]$Config.title }
         items = $items
-        auto_close_seconds = if ($null -eq $popup.auto_close_seconds) { 8 } else { [int]$popup.auto_close_seconds }
-        max_visible = if ($null -eq $popup.max_visible) { 3 } else { [int]$popup.max_visible }
+        duration = Get-ToastDuration $Config
     }
     if ($Config.enabled -ne $false) { Invoke-DetachedNotifier $payload }
 }
@@ -178,16 +189,18 @@ function Complete-Turn([object]$Payload) {
     Invoke-UsageNotification $config $context
 }
 
-try {
-    $inputText = Read-Utf8Stdin
-    if ([string]::IsNullOrWhiteSpace($inputText)) { exit 0 }
-    try { $payload = $inputText | ConvertFrom-Json } catch { $script:HookPayloadParseError = $true; throw 'Hook payload JSON is invalid' }
-    switch ([string]$payload.hook_event_name) { 'UserPromptSubmit' { Start-Turn $payload }; 'Stop' { Complete-Turn $payload } }
-}
-catch {
+if ($MyInvocation.InvocationName -ne '.') {
     try {
-        if ($script:HookPayloadParseError) { Append-ErrorLog 'Hook payload rejected: invalid JSON' } else { Append-ErrorLog $_.Exception.ToString() }
-    } catch { }
-    try { Invoke-DetachedNotifier (New-ErrorNotification 'Unable to collect API usage data.') } catch { }
-    exit 0
+        $inputText = Read-Utf8Stdin
+        if ([string]::IsNullOrWhiteSpace($inputText)) { exit 0 }
+        try { $payload = $inputText | ConvertFrom-Json } catch { $script:HookPayloadParseError = $true; throw 'Hook payload JSON is invalid' }
+        switch ([string]$payload.hook_event_name) { 'UserPromptSubmit' { Start-Turn $payload }; 'Stop' { Complete-Turn $payload } }
+    }
+    catch {
+        try {
+            if ($script:HookPayloadParseError) { Append-ErrorLog 'Hook payload rejected: invalid JSON' } else { Append-ErrorLog $_.Exception.ToString() }
+        } catch { }
+        try { Invoke-DetachedNotifier (New-ErrorNotification 'Unable to collect API usage data.') } catch { }
+        exit 0
+    }
 }
