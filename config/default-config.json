@@ -6,7 +6,14 @@
   "pricing": {
     "unit": "per_million_tokens",
     "currency": "USD",
-    "models": {}
+    "models": {
+      "gpt-5.6-sol": {
+        "input": 1,
+        "cache_read": 0.1,
+        "cache_creation": 1.25,
+        "output": 5
+      }
+    }
   },
   "items": [
     { "label": "费用", "field": "total_cost_usd", "format": "currency_usd" },

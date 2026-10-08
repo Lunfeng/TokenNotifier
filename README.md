@@ -17,6 +17,13 @@ https://github.com/Lunfeng/TokenNotifier.git
 Review and trust the plugin Hooks when Codex asks. The package registers four
 Hooks: `UserPromptSubmit`, `SubagentStop`, `Stop`, and `Interrupt`.
 
+`UserPromptSubmit` starts a byte-offset marker for the root turn.
+`SubagentStop` stores that subagent's rollout usage for the root turn without
+showing a separate Toast. `Stop` and `Interrupt` finish the root turn, include
+its subagent usage, and show one completed or interrupted notification. These
+markers and fragments are transient and are removed when the root turn is
+finished.
+
 ## Requirements
 
 - Windows 10 or Windows 11.
@@ -36,6 +43,10 @@ the session's rollout records to build cumulative values. The model for each
 record is taken from the matching `turn_context.payload.model` entry. Records
 are deduplicated by `response_id`, and no prompt, answer, reasoning, tool input,
 or tool output is persisted.
+
+Each notification title uses the Codex thread name from the local session index
+(`TokenNotifier · <thread name>`), which keeps concurrent turns distinguishable.
+Set `title` in the user configuration to override the generated title.
 
 The current-turn fields are `input_tokens`, `cached_input_tokens`,
 `cache_write_input_tokens`, `cache_read_tokens`, `cache_creation_tokens`,
@@ -59,10 +70,10 @@ one million tokens:
     "currency": "USD",
     "models": {
       "gpt-5.6-sol": {
-        "input": 2.5,
-        "cache_read": 0.25,
-        "cache_creation": 0,
-        "output": 15
+        "input": 1,
+        "cache_read": 0.1,
+        "cache_creation": 1.25,
+        "output": 5
       }
     }
   }
@@ -86,9 +97,11 @@ Current-turn costs are `input_cost_usd`, `output_cost_usd`,
 Session-wide costs use the corresponding `session_*_cost_usd` fields, including
 `session_total_cost_usd` (also available as `thread_total_cost_usd`). Multiple
 models and subagent records are priced independently before aggregation. If a
-model has no pricing entry, token rows still render, cost rows render as `--`,
-and the Toast reports the number of models missing a price. If no usage record
-is available, the Toast remains visible with no metric rows.
+model has no pricing entry, the turn is marked partial: token rows still
+render, cost rows render as `--`, and the Toast reports how many models are
+missing a price. If no usable usage record is available, the turn is marked
+unavailable: the Toast remains visible with no metric rows and identifies the
+missing usage. Interrupted turns use the corresponding interrupted status.
 
 ## Toast Registration
 
@@ -125,7 +138,14 @@ The packaged defaults are in `config/default-config.json`:
   "pricing": {
     "unit": "per_million_tokens",
     "currency": "USD",
-    "models": {}
+    "models": {
+      "gpt-5.6-sol": {
+        "input": 1,
+        "cache_read": 0.1,
+        "cache_creation": 1.25,
+        "output": 5
+      }
+    }
   },
   "items": [
     { "label": "费用", "field": "total_cost_usd", "format": "currency_usd" },
@@ -137,6 +157,11 @@ The packaged defaults are in `config/default-config.json`:
   ]
 }
 ```
+
+Rates in the packaged file are the current default for `gpt-5.6-sol`; change
+the model table to match the models and rates used by your account. A user
+configuration file is loaded as the complete configuration, so copy any
+packaged sections you want to keep when creating it.
 
 Each item must define exactly one `field` or `expression`. Expressions support
 numeric literals, parentheses, unary signs, `+`, `-`, `*`, `/`, comparisons,
@@ -160,12 +185,13 @@ provided. Otherwise data is stored under:
 %USERPROFILE%\.codex\token-notifier
 ```
 
-`usage.jsonl` contains minimal rollout usage projections and turn summaries.
-`errors.log` contains non-blocking collection, configuration, registration, or
-Toast failures. `TOKENNOTIFIER_DATA_ROOT`, `TOKENNOTIFIER_CONFIG_PATH`, and
-`TOKENNOTIFIER_NOTIFIER_COMMAND` can override local paths or the notifier
-command. The former `APINOTIFIER_*` variables remain accepted as migration
-aliases.
+`state` contains transient turn markers, subagent fragments, and the short-lived
+notification handoff payload. `usage.jsonl` contains minimal rollout usage
+projections and turn summaries. `errors.log` contains non-blocking collection,
+configuration, registration, or Toast failures. `TOKENNOTIFIER_DATA_ROOT`,
+`TOKENNOTIFIER_CONFIG_PATH`, and `TOKENNOTIFIER_NOTIFIER_COMMAND` can override
+local paths or the notifier command. The former `APINOTIFIER_*` variables
+remain accepted as migration aliases.
 
 Hooks are fail-open: collection or notification failures never block Codex.
 
