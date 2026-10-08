@@ -1,10 +1,21 @@
 $script:AllowedEvaluatorFields = @(
-    'request_count', 'input_tokens', 'output_tokens', 'cache_read_tokens',
-    'cache_creation_tokens', 'input_cost_usd', 'output_cost_usd',
-    'cache_read_cost_usd', 'cache_creation_cost_usd', 'total_cost_usd',
+    'request_count', 'input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
+    'cache_read_tokens', 'cache_creation_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens',
+    'input_cost_usd', 'output_cost_usd', 'cache_read_cost_usd', 'cache_creation_cost_usd', 'total_cost_usd',
+    'session_input_tokens', 'session_cached_input_tokens', 'session_cache_write_input_tokens',
+    'session_cache_read_tokens', 'session_cache_creation_tokens', 'session_output_tokens',
+    'session_reasoning_output_tokens', 'session_total_tokens',
+    'thread_input_tokens', 'thread_cached_input_tokens', 'thread_cache_write_input_tokens',
+    'thread_cache_read_tokens', 'thread_cache_creation_tokens', 'thread_output_tokens',
+    'thread_reasoning_output_tokens', 'thread_total_tokens',
+    'session_input_cost_usd', 'session_output_cost_usd', 'session_cache_read_cost_usd',
+    'session_cache_creation_cost_usd', 'session_total_cost_usd',
+    'thread_input_cost_usd', 'thread_output_cost_usd', 'thread_cache_read_cost_usd',
+    'thread_cache_creation_cost_usd', 'thread_total_cost_usd',
     'duration_ms_total', 'duration_ms_max', 'first_token_ms_first',
     'model', 'provider_id', 'status_code', 'codex_session_id',
     'codex_turn_id', 'codex_cwd', 'turn_outcome', 'attribution_status',
+    'usage_status', 'pricing_status', 'session_pricing_status', 'missing_model_count', 'session_missing_model_count',
     'matched_request_count', 'unmatched_request_count', 'thread_name'
 )
 
@@ -206,7 +217,7 @@ function Format-DisplayValue([object]$Value, [string]$Format) {
         'text' { return [string]$Value }
         'integer' { return ([decimal]$Value).ToString('N0', $culture) }
         'decimal' { return ([decimal]$Value).ToString('0.####', $culture) }
-        'currency_usd' { return ([decimal]$Value).ToString('$#,##0.00##', $culture) }
+        'currency_usd' { return ([decimal]$Value).ToString('$#,##0.######', $culture) }
         'percent' { return (([decimal]$Value) * [decimal]100).ToString('0.##', $culture) + '%' }
         'milliseconds' { return ([decimal]$Value).ToString('N0', $culture) + ' ms' }
         default { throw "Unknown format: $Format" }

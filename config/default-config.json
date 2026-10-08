@@ -3,10 +3,17 @@
   "toast": {
     "duration": "short"
   },
+  "pricing": {
+    "unit": "per_million_tokens",
+    "currency": "USD",
+    "models": {}
+  },
   "items": [
     { "label": "费用", "field": "total_cost_usd", "format": "currency_usd" },
     { "label": "输入 Token", "field": "input_tokens", "format": "integer" },
     { "label": "输出 Token", "field": "output_tokens", "format": "integer" },
-    { "label": "总 Token", "expression": "input_tokens + output_tokens", "format": "integer" }
+    { "label": "总 Token", "expression": "input_tokens + output_tokens", "format": "integer" },
+    { "label": "会话总 Token", "field": "session_total_tokens", "format": "integer" },
+    { "label": "会话总费用", "field": "session_total_cost_usd", "format": "currency_usd" }
   ]
 }
